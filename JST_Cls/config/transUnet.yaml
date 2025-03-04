@@ -1,0 +1,4 @@
+MODEL:
+  NAME: transUnet
+  NUM_OUTPUTS: 1
+  PRETRAINED: './pretrained_weight/simclr1.pth'

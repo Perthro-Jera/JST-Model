@@ -1,0 +1,45 @@
+MODEL:
+  NAME: UTNet
+  IN_CHAN: 3        # 输入通道数，例如RGB图像是3，灰度图像是1
+  BASE_CHAN: 64     # 基础通道数
+  # 其他与UTNet模型相关的参数，如果有需要的话可以在这里添加
+  NUM_CLASSES: 8
+  REDUCE_SIZE: 8       # 缩小尺寸。用于缩小特征图尺寸的变换操作。
+  BLOCK_LIST: '234'    # 指定在这些层使用Transformer模块。例如'234'表示在第2, 3, 4层使用。
+  NUM_BLOCKS: [1, 2, 4, 6]  # 每个层中的Transformer块数量。这个列表的长度应该与层数匹配。
+  PROJECTION: 'interp' # 投影方法。可以是'interp'（插值）或其他方法。
+  NUM_HEADS: [2, 4, 8, 16] # 每层中的头数，用于多头注意力机制。每个值应对应于一个Transformer层。
+  ATTN_DROP: 0.0       # 注意力丢弃率。用于防止过拟合。
+  PROJ_DROP: 0.0       # 投影丢弃率。用于防止过拟合。
+  BOTTLENECK: False    # 是否使用瓶颈结构。True表示使用，False表示不使用。
+  MAXPOOL: True        # 是否在下采样时使用最大池化。True表示使用，False表示不使用。
+  REL_POS: True        # 是否使用相对位置编码。True表示使用，False表示不使用。
+  AUX_LOSS: False      # 是否使用辅助损失。True表示使用辅助损失，False表示不使用。
+
+DATA:
+  # FRAME_HEIGHT: 512   # 图像帧高度
+  # FRAME_WIDTH: 1024   # 图像帧宽度
+  # IGNORE_LABEL: -1    # 忽略标签
+
+TRAIN:
+  EPOCHS: 100         # 训练的总轮数
+  BATCH_SIZE: 16      # 训练时的批处理大小
+  NUM_WORKERS: 4      # 数据加载的工作线程数
+  LR: 5e-4            # 学习率
+  MOMENTUM: 0.9       # 动量
+  WEIGHT_DECAY: 1e-2  # 权重衰减
+  NESTEROV: True      # 是否使用Nesterov动量
+
+OPTIMIZER:
+  NAME: sgd           # 优化器的名字
+
+LOSS:
+  USE_OHEM: False     # 是否使用OHEM
+  OHEMTHRES: 0.8      # OHEM的阈值
+  OHEMKEEP: 125000    # OHEM保持的最少数量
+
+MISC:
+  PRE_TRAIN: True     # 是否使用预训练权重
+  CHECKPOINT_DIR: checkpoint  # 模型权重的保存路径
+  SEED: 42            # 随机种子
+  FOLD_NUM: 0         # 用于交叉验证的fold number
