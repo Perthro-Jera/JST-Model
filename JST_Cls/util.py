@@ -61,7 +61,8 @@ class DAForTrain(object):
 class DAForMedNeXtTrain(object):
     def __init__(self, args):
         self.transform = A.Compose([
-            A.RandomCrop(height=args.frame_height, width=args.frame_width, always_apply=True),
+            #A.RandomCrop(height=args.frame_height, width=args.frame_width, always_apply=True),
+            A.Resize(height=args.frame_height, width=args.frame_width,interpolation=cv2.INTER_NEAREST),
             A.HorizontalFlip(p=0.5),
         ])
         self.img_transform = A.Compose([
@@ -214,7 +215,8 @@ class RandomMask(object):
 class DAForClsTrain(object):
     def __init__(self, args):
         self.transform = A.Compose([
-            A.RandomResizedCrop(height=args.frame_height, width=args.frame_width, always_apply=True),
+            #A.RandomResizedCrop(height=args.frame_height, width=args.frame_width, always_apply=True),
+            A.Resize(height=args.frame_height, width=args.frame_width, interpolation=cv2.INTER_NEAREST),
             A.HorizontalFlip(p=0.5),
         ],additional_targets={'texture': 'image'})
         self.img_transform = A.Compose([
@@ -262,6 +264,8 @@ class DAForClsTest(object):
     def __init__(self, args):
         self.transform = A.Compose([
             A.Resize(height=args.frame_height, width=args.frame_width, always_apply=True),
+            #A.Resize(height=args.frame_height, width=args.frame_width, interpolation=cv2.INTER_NEAREST),
+
         ],additional_targets={'texture': 'image'})
         self.img_transform = A.Compose([
             A.Normalize(mean=OCT_DEFAULT_MEAN,
@@ -383,6 +387,7 @@ class LBPDAForSegVit:
         texture = torch.tensor(texture, dtype=torch.float32).unsqueeze(0)  # [1, H, W]
 
         return image, texture
+
 class ImageProcessor(object):
     def __init__(self, args, augmentation='train'):
         self.augmentation = augmentation

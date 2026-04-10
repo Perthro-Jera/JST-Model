@@ -11,15 +11,15 @@ import pandas as pd
 import cv2
 from models.drae import DRAE
 import models.resnet as resnet
-import models.resnet1 as resnet1
+#import models.resnet1 as resnet1
 import models.convnext as convnext
 from models.ae_densenet121 import ModifiedDenseNet121
-from models.Unet import UNetClassifier
+#from models.Unet import UNetClassifier
 #import models.vision_mamba as vim
 #import models.vmamba as vmamba
 import timm
-import models.swin_transformer as swin_transformer
-import models.cswin as cswin
+#import models.swin_transformer as swin_transformer
+#import models.cswin as cswin
 from models.seg_drae import FusionModel
 from models.MedNextV1 import get_MedNeXt_model
 import albumentations as A
@@ -28,9 +28,10 @@ import math
 from albumentations.pytorch.transforms import ToTensorV2
 
 
+
 # === 1. 配置参数 ===
-MODEL_NAME = 'ae_densenet121'
-EPOCHS = 50
+MODEL_NAME = 'convnext_pico'
+EPOCHS = 60
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 MIN_LR = 5e-7
@@ -38,18 +39,19 @@ WARMUP_EPOCHS = 10
 WEIGHT_DECAY = 0.6
 WEIGHT_DECAY_END = 0.4
 LATENT_DIM = 256
-HEIGHT = 512
-WIDTH = 1024
+HEIGHT = 256
+WIDTH = 512
 OCT_DEFAULT_MEAN = (0.3124)
 OCT_DEFAULT_STD = (0.2206)
 DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")  # 使用 GPU 1
-MODEL_SAVE_PATH = 'checkpoint/drae/ae_densenet121_checkpoint.pth'  # 保存模型的路径
+MODEL_SAVE_PATH = 'checkpoint/baseline/checkpoint_111.pth'  # 保存模型的路径
 
 # === 2. 数据增强 ===
 train_transforms = A.Compose([
-    A.RandomResizedCrop(size=(HEIGHT, WIDTH),
-                        scale=(0.5, 1.0), ratio=(1.75, 2.25),
-                        interpolation=cv2.INTER_CUBIC),
+    # A.RandomResizedCrop(size=(HEIGHT, WIDTH),
+    #                     scale=(0.5, 1.0), ratio=(1.75, 2.25),
+    #                     interpolation=cv2.INTER_CUBIC),
+    A.Resize(height=HEIGHT, width=WIDTH, interpolation=cv2.INTER_CUBIC),
     A.HorizontalFlip(),
     A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=1),
     A.GaussianBlur(p=0.2),
@@ -284,8 +286,8 @@ def train():
 
         for batch_idx, (batch_images, batch_labels) in enumerate(train_loader):
             batch_images, batch_labels = batch_images.to(DEVICE), batch_labels.to(DEVICE)
-
-            #batch_images = batch_images.repeat(1, 3, 1, 1)
+            batch_start_time = time.time()  # 记录开始时间
+            batch_images = batch_images.repeat(1, 3, 1, 1)
             output = clsmodel(batch_images)
 
 
@@ -296,7 +298,8 @@ def train():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
+            batch_time = time.time() - batch_start_time
+            print(f"Batch Time: {batch_time:.2f} seconds.")
 
             total_cls_loss += cls_loss.item()
 

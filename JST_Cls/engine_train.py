@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import time
+import os
 from util import DataUpdater, get_confusion_matrix, adjust_learning_rate
 from einops import rearrange
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ from torch.cuda.amp import autocast, GradScaler
 import cv2
 from skimage.feature import graycomatrix, graycoprops
 from skimage.color import rgb2gray  # 导入灰度转换函数
+import matplotlib.pyplot as plt
 
 
 
@@ -394,7 +396,7 @@ def compute_consistency_loss(output1, output2, consistency_criterion, deep_super
 
 
 def train_mednext_one_epoch(model, train_loader, optimizer, segmentation_criterion,
-                              epoch, total_epoches, num_ite_per_epoch, base_lr):
+                              epoch, total_epoches, num_ite_per_epoch, base_lr, dice_loss_fn = None):
     # Training
     model.train()
     total_iters = num_ite_per_epoch * total_epoches
@@ -415,9 +417,12 @@ def train_mednext_one_epoch(model, train_loader, optimizer, segmentation_criteri
         # 获取模型的输出
         segmentation_output = model(images)
 
-        # 计算分割的损失
-        segmentation_loss = compute_loss(segmentation_criterion, segmentation_output, masks)
 
+        # 计算分割的损失
+        loss_ce = compute_loss(segmentation_criterion, segmentation_output, masks)
+        probs = F.softmax(segmentation_output[0], dim=1)
+        loss_dice = dice_loss_fn(probs, masks)
+        segmentation_loss = loss_ce + loss_dice
 
         optimizer.zero_grad()
         # 反向传播，并在混合精度上下文中进行梯度缩放
@@ -797,17 +802,134 @@ def train_rec_cls_epoch(segmodel, clsmodel, drae_encoder, fusion_model, train_lo
     return ave_classification_loss.avg
 
 def discriminative_loss(z, labels):
-    """Fisher 判别损失"""
+    """Fisher 判别损失（稳定版）"""
     z_neg = z[labels == 0]
     z_pos = z[labels == 1]
 
-    mu_neg, sigma_neg = torch.mean(z_neg, dim=0), torch.var(z_neg, dim=0)
-    mu_pos, sigma_pos = torch.mean(z_pos, dim=0), torch.var(z_pos, dim=0)
+    # 如果某一类不存在，跳过判别损失
+    if z_neg.shape[0] < 2 or z_pos.shape[0] < 2:
+        return torch.tensor(0.0, device=z.device)
+
+    mu_neg = torch.mean(z_neg, dim=0)
+    sigma_neg = torch.var(z_neg, dim=0, unbiased=False)
+
+    mu_pos = torch.mean(z_pos, dim=0)
+    sigma_pos = torch.var(z_pos, dim=0, unbiased=False)
 
     inter_class_variance = torch.norm(mu_neg - mu_pos) ** 2
     intra_class_variance = sigma_neg.mean() + sigma_pos.mean()
 
-    return intra_class_variance / (inter_class_variance + 1e-6)
+    loss = intra_class_variance / (inter_class_variance + 1e-6)
+
+    return loss
+
+
+
+def positive_discriminative_loss(z, labels):
+    """
+    判别损失：仅对阳性类别（label 3 和 4）之间进行类间区分
+    z: 特征向量 (B, D)
+    labels: 对应标签 (B,)
+    """
+    # 只提取阳性样本（label == 3 或 4）
+    mask_pos = (labels == 3) | (labels == 4)
+    z_pos = z[mask_pos]
+    pos_labels = labels[mask_pos]
+
+    # 如果阳性样本不足两个类别，跳过
+    if (pos_labels == 3).sum() == 0 or (pos_labels == 4).sum() == 0:
+        return torch.tensor(0.0, device=z.device, requires_grad=True)
+
+    z_3 = z_pos[pos_labels == 3]
+    z_4 = z_pos[pos_labels == 4]
+
+    mu_3 = torch.mean(z_3, dim=0)
+    mu_4 = torch.mean(z_4, dim=0)
+
+    sigma_3 = torch.var(z_3, dim=0)
+    sigma_4 = torch.var(z_4, dim=0)
+
+    inter_class_variance = torch.norm(mu_3 - mu_4) ** 2
+    intra_class_variance = sigma_3.mean() + sigma_4.mean()
+
+    loss = intra_class_variance / (inter_class_variance + 1e-6)
+    return loss
+
+def show_seg_pred(pred_mask):
+    label_colors = np.array([
+        [0, 0, 0],  # 类别0，背景
+        [128, 0, 0],  # 类别1
+        [0, 128, 0],  # 类别2
+        [128, 128, 0],  # 类别3
+        [0, 0, 128],  # 类别4
+        [128, 0, 128],  # 类别5
+        [0, 128, 128],  # 类别6
+        [128, 128, 128],  # 类别7
+    ])
+    # 彩色化预测结果
+    pred_mask_for_save = pred_mask.squeeze(1).cpu().numpy()  # [B, H, W]
+
+
+    for i in range(pred_mask_for_save.shape[0]):
+        color_mask = label_colors[pred_mask_for_save[i]]  # 使用颜色映射将类别索引转换为RGB
+        color_mask = np.asarray(color_mask, dtype=np.uint8)  # 转换为uint8类型数组
+
+        # 使用matplotlib显示结果
+        plt.figure(figsize=(6, 6))
+        plt.imshow(color_mask)
+        plt.title(f"Predicted Mask for knowsam Image {i}")
+        plt.axis('off')  # 去掉坐标轴
+        plt.show()
+
+
+
+
+def save_segmentation_vis(
+    gray_image,      # [1, H, W]
+    seg_logits,      # [C, H, W]
+    save_path
+):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    gray = gray_image.squeeze().cpu().numpy()
+    pred = torch.argmax(seg_logits, dim=0).cpu().numpy()
+
+    plt.figure(figsize=(10, 4))
+
+    plt.subplot(1, 3, 1)
+    plt.title("Original OCT")
+    plt.imshow(gray, cmap="gray")
+    plt.axis("off")
+
+    plt.subplot(1, 3, 2)
+    plt.title("Segmentation")
+    plt.imshow(pred, cmap="jet")
+    plt.axis("off")
+
+    plt.subplot(1, 3, 3)
+    plt.title("Overlay")
+    plt.imshow(gray, cmap="gray")
+    plt.imshow(pred, cmap="jet", alpha=0.4)
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+EYE_CLASS_NAMES = {
+    0: "NORMAL",
+    1: "AMD",
+    2: "DME"
+}
+
+CEV_CLASS_NAMES = {
+    0:'宫颈炎',
+    1:'囊肿',
+    2:'外翻' ,
+    3:'高级别病变',
+    4:'宫颈癌'
+}
 
 def train_seg_drae_epoch(segmodel, clsmodel, train_loader, optimizer, criterion, recon_criterion,
                          epoch, total_epoches, num_ite_per_epoch, lr_schedule_values,
@@ -827,45 +949,104 @@ def train_seg_drae_epoch(segmodel, clsmodel, train_loader, optimizer, criterion,
     tic = time.time()
 
     for i_iter, batch in enumerate(train_loader):
-        images, _, labels, _, _ = batch
+        images, _, labels, img_paths, _ = batch
         images = images.to(device, non_blocking=True)
         labels = torch.tensor(labels).clone().detach().long().to(device, non_blocking=True)
 
         # **避免额外梯度计算**
         with torch.no_grad():
             seg_output, _, _, _, _ = segmodel(images)
-            # 转为灰度图
-            gray_image = images[:, 0:1, :, :]  # 提取单通道图像
+            gray_image = images[:, 0:1, :, :]
+
+            # ================== 保存 segmentation 可视化 ==================
+            # 每个 epoch 都存，但限制每类最多保存 K 张
+            # 每个 epoch 单独统计一次
+            saved_counter = {}
+            MAX_SAVE_PER_CLASS = 10
+
+            # ================== 保存 segmentation 可视化 ==================
+            if i_iter % 3 == 0:
+                save_root = f"./debug_seg_vis_cervical/epoch_{epoch + 1:02d}"
+
+                for b in range(images.size(0)):
+                    cls = int(labels[b].item())
+
+                    if cls not in saved_counter:
+                        saved_counter[cls] = 0
+                    if saved_counter[cls] >= MAX_SAVE_PER_CLASS:
+                        continue
+
+                    class_name = CEV_CLASS_NAMES.get(cls, f"class_{cls}")
+
+                    save_dir = os.path.join(
+                        save_root,
+                        f"class_{cls}_{class_name}"
+                    )
+                    os.makedirs(save_dir, exist_ok=True)
+
+                    save_name = f"iter{i_iter}_b{b}.png"
+                    save_path = os.path.join(save_dir, save_name)
+
+                    # === 保存 segmentation 可视化 ===
+                    save_segmentation_vis(
+                        gray_image[b],
+                        seg_output[b],
+                        save_path
+                    )
+
+                    # === 新增：保存原图路径信息 ===
+                    meta_path = os.path.join(save_dir, "meta.txt")
+                    with open(meta_path, "a") as f:
+                        f.write(
+                            f"{save_name} | label={cls} | img_path={img_paths[b]}\n"
+                        )
+
+                    saved_counter[cls] += 1
+
             pred_mask = torch.argmax(seg_output, dim=1)  # [batch_size, height, width]
+            #show_seg_pred(pred_mask)
             pred_mask = pred_mask.unsqueeze(1).float()
-            pred_mask = pred_mask.repeat(1, 3, 1, 1) # 扩展通道，变为 [12, 3, 512, 1024]
-            #print("seg_map shape:", pred_mask.shape)
+            seg_image = pred_mask.repeat(1, 3, 1, 1) # 扩展通道，变为 [12, 3, 512, 1024]
+
+            # 将类别 1 和 5 的像素值设置为 0
+
+            pred_mask[(pred_mask == 1) | (pred_mask == 5)] = 0
+            pred_mask[(pred_mask == 2) | (pred_mask == 3) | (pred_mask == 4) | (pred_mask == 6) | (pred_mask == 7)] = 1
+            extracted_image = gray_image * pred_mask
+            # 将类别 5 的像素值设置为 0
+            # 眼科OCT数据
+            # pred_mask[(pred_mask == 5)] = 0
+            # pred_mask[(pred_mask == 1) | (pred_mask == 2) | (pred_mask == 3) | (pred_mask == 4) ] = 1
+            # extracted_image = gray_image * pred_mask
+            #extracted_image = gray_image
 
         # 训练分类模型
         optimizer.zero_grad()
 
         # 前向传播
-        outputs, _, recon = clsmodel(gray_image, pred_mask)
+        outputs, z, recon = clsmodel(extracted_image, seg_image)
 
         # 分类损失
         classification_loss = criterion(outputs, labels)
 
         # 重构损失
-        reconstruction_loss = recon_criterion(recon, gray_image)
-        
-        #discriminative_loss = discriminative_loss()
+        if recon is not None:
+            reconstruction_loss = recon_criterion(recon, gray_image)
+
+        disc_loss = discriminative_loss(z,labels)
 
         # 总损失（加权组合）
-        total_loss = classification_loss + 0.5 * reconstruction_loss  # 调整权重 0.1 根据实际情况优化
-
+        #total_loss = classification_loss + 0.5 * reconstruction_loss  # 宫颈OCT的权重
+        #total_loss = classification_loss + 0.1 * reconstruction_loss + 0.1 * disc_loss # 眼科OCT的权重
+        total_loss = classification_loss +  0.1 * disc_loss # 眼科OCT的权重，特征金字塔没有重构损失
         # 反向传播
         total_loss.backward()
         optimizer.step()
 
         # 更新损失
         ave_classification_loss.update(classification_loss.item())
-        ave_reconstruction_loss.update(reconstruction_loss.item())
-        #ave_discriminative_loss.update(disc_loss.item())
+        #ave_reconstruction_loss.update(reconstruction_loss.item())
+        ave_discriminative_loss.update(disc_loss.item())
         ave_total_loss.update(total_loss.item())
 
         # 根据 cosine scheduler 修改 optimizer 的 learning rate 和 weight decay
@@ -878,10 +1059,10 @@ def train_seg_drae_epoch(segmodel, clsmodel, train_loader, optimizer, criterion,
 
         if i_iter % 5 == 0:
             msg = ('Epoch: [{}/{}] Iter:[{}/{}], Time: {:.2f}, Cls LR: {}, '
-                   'Cls Loss: {:.6f}, Recon Loss: {:.6f}, Total Loss: {:.6f}').format(
+                   'Cls Loss: {:.6f},Disc Loss: {:.6f}, Total Loss: {:.6f}').format(
                 epoch + 1, total_epoches, i_iter, num_ite_per_epoch,
                 batch_time.avg, [x['lr'] for x in optimizer.param_groups],
-                ave_classification_loss.avg, ave_reconstruction_loss.avg, ave_total_loss.avg)
+                ave_classification_loss.avg,ave_discriminative_loss.avg, ave_total_loss.avg)
             print(msg)
 
         # 计算时间

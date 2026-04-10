@@ -16,6 +16,7 @@ from models.ae_densenet121 import ModifiedDenseNet121
 from models.seg_drae import FusionModel
 from torch.utils.data import DataLoader
 from models.MedNextV1 import get_MedNeXt_model
+from models.semi_MedNeXt import KnowSAM
 from models.Multi_GlaucNet import ClassifierWithSegmentation
 from util import save_checkpoint, seeding
 from criterion import CrossEntropy, OhemCrossEntropy
@@ -26,14 +27,16 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from skimage.feature import graycomatrix, graycoprops
 from skimage.color import rgb2gray  # 导入灰度转换函数
 import matplotlib.pyplot as plt
+from torchsummary import summary
+import time
 
 
 def parse_option():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', default='seg_drae', type=str,
-                        choices=['resnet18', 'convnext_pico',  'vit_base', 'vmamba_tiny', 'GlaucNet','ae_densenet121'],
+    parser.add_argument('--model_name', default='GlaucNet', type=str,
+                        choices=['resnet18', 'convnext_pico',  'vit_base', 'vmamba_tiny', 'GlaucNet', 'ae_densenet121'],
                         help='the model we used.')
-    parser.add_argument('--test_file', default='xiangyang',
+    parser.add_argument('--test_file', default='internal',
                         choices=['internal', 'huaxi', 'xiangya', 'xiangyang'],
                         help="the test file from different center", type=str)
     parser.add_argument('--train_pattern', type=str, default="seg_drae",
@@ -42,8 +45,8 @@ def parse_option():
     parser.add_argument('--num_class', default=5, type=int, help="class num")
 
     # parameters for data
-    parser.add_argument('--frame_height', type=int, default=512, help='the frame height we used during training.')
-    parser.add_argument('--frame_width', type=int, default=1024, help='the frame width we used during training.')
+    parser.add_argument('--frame_height', type=int, default=256, help='the frame height we used during training.')
+    parser.add_argument('--frame_width', type=int, default=512, help='the frame width we used during training.')
     parser.add_argument('--ignore_label', type=int, default=-1, help='ignoring the label of pixels')
 
     # folder num，以便用于内部数据集的交叉验证
@@ -70,6 +73,10 @@ def parse_option():
     parser.add_argument('--use_ohem', default=False, type=bool, help='whether use ohem for cross entropy')
     parser.add_argument('--ohemthres', default=0.9, type=float, help='threshold for ohem')
     parser.add_argument('--ohemkeep', type=int, default=125000, help='minimal numbers of ohem')
+
+    parser.add_argument('--seg_model', default='KnowSAM', choices=['MedNeXt', 'KnowSAM'], help='选择分割模型')
+    parser.add_argument('--in_channels', type=int, default=3)
+    parser.add_argument('--num_classes', type=int, default=8)
 
     args = parser.parse_args()
     return args
@@ -104,7 +111,8 @@ def merge_config(args):
 #加载分割模型训练权重
 def load_seg_weight(model):
     directory_path = os.path.join('train', 'MedNeXt', 'random_initial', '2')
-    weight_path = os.path.join('checkpoint',directory_path, 'MedNeXt_checkpoint_huafen337.pth')
+    #weight_path = os.path.join('checkpoint',directory_path, 'MedNeXt_checkpoint_huafen337.pth')
+    weight_path = os.path.join('checkpoint', directory_path, 'MedNeXt_checkpoint_256_300.pth')
     #weight_path = os.path.join(weight_path, 'segmodel_checkpoint.pth')
     # 加载模型权重
     print('==> loading teacher model')
@@ -115,9 +123,19 @@ def load_seg_weight(model):
     print(state)
     return model
 
+def load_KnowSAM_weight(model):
+
+    weight_path = os.path.join('checkpoint/train/KnowSAM/results_OCT_resize256_nomixup30_mednext_unet1000_3/fold_0/SGDL_best_model.pth')
+    # 加载模型权重
+    print('==> loading seg model')
+    state = model.load_state_dict(torch.load(weight_path), strict=True)
+    print('loading checkpoint from {}'.format(weight_path))
+    print(state)
+    return model
+
 def load_cls_weight(model, weight_path):
-    weight_path = 'checkpoint/jst'
-    weight_path = os.path.join(weight_path, 'checkpoint0222.pth')
+    weight_path = 'checkpoint/baseline'
+    weight_path = os.path.join(weight_path, 'checkpoint_glaucnet256.pth')
     # 加载模型模型权重
     print('==> loading teacher model')
     checkpoint = torch.load(weight_path, map_location='cpu')
@@ -141,16 +159,32 @@ def convert_to_serializable(obj):
     else:
         return obj
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
+def count_parameters(model):
+    total = 0
+    print("模块参数统计如下：")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"{name:60s} \t参数量: {param.numel()}")
+            total += param.numel()
+    print(f"\n总可训练参数量：{total:,}")
+    return total
 
 def test_cls(segmodel, clsmodel, test_loader, criterion, config):
     segmodel.eval()
     clsmodel.eval()
+    print(f"Segmentation model parameters: {count_parameters(segmodel):,}")
+    print(f"Classification model parameters: {count_parameters(clsmodel):,}")
     ave_loss = DataUpdater()
     device = next(segmodel.parameters()).device
     num_class = 5  # 你的分类数是 5
 
+    total_infer_time = 0
+    total_samples = 0
+    total_seg_infer_time = 0
+    total_cls_infer_time = 0
 
     all_labels = []
     all_predictions = []
@@ -171,11 +205,14 @@ def test_cls(segmodel, clsmodel, test_loader, criterion, config):
             texture = texture.to(device, non_blocking=True)
             labels = labels.clone().detach().long().to(device, non_blocking=True)
 
+            # >>>> 推理时间计时开始 >>>>
+            start_total = time.perf_counter()
 
             # 分类模型预测
             if args.train_pattern in ['mask_train', 'train']:
                 images = images[:, 0:1, :, :]
                 pred_cls = clsmodel(images)
+
             elif args.train_pattern in ['drae_train']:
                 seg_output, _, _, _, _ = segmodel(images)
                 # print(f"Image shape: {images.shape}")  # 输出图像形状
@@ -189,31 +226,46 @@ def test_cls(segmodel, clsmodel, test_loader, criterion, config):
                 print("Fused features mean:", fused_features.mean().item())
                 pred_cls = clsmodel(fused_features)
             elif args.train_pattern == 'seg_drae':
+                start_seg = time.perf_counter()
                 seg_output, _, _, _, _ = segmodel(images)
-                # print(f"Image shape: {images.shape}")  # 输出图像形状
+                end_seg = time.perf_counter()
+                total_seg_infer_time += (end_seg - start_seg)
                 # 转为灰度图
                 gray_image = images[:, 0:1, :, :]  # 取 B 通道
                 pred_mask = torch.argmax(seg_output, dim=1)  # [batch_size, height, width]
                 pred_mask = pred_mask.unsqueeze(1).float()
-                seg_image = pred_mask.repeat(1, 3, 1, 1)  # 扩展通道，变为 [12, 3, 512, 1024]
+                # pred_mask = F.interpolate(pred_mask, size=(256, 512), mode='nearest')
+                # gray_image = F.interpolate(gray_image, size=(256, 512), mode='nearest')
+                seg_image = pred_mask.repeat(1, 3, 1, 1)  # 扩展通道，变为 [1, 3, 512, 1024]
                 # 将类别 1 和 5 的像素值设置为 0
                 pred_mask[(pred_mask == 1) | (pred_mask == 5) ] = 0
                 pred_mask[(pred_mask == 2) | (pred_mask == 3) | (pred_mask == 4) | (pred_mask == 6) | (pred_mask == 7)] = 1
 
                 extracted_image = gray_image * pred_mask
+                start_cls = time.perf_counter()
+                #glaucnet
+                pred_mask = pred_mask.repeat(1, 2, 1, 1) # 扩展通道，变为 [12, 3, 512, 1024]
+                pred_cls = clsmodel(gray_image, pred_mask)
+                #pred_cls, _, _ = clsmodel(extracted_image, seg_image)
+                end_cls = time.perf_counter()
+                total_cls_infer_time += (end_cls - start_cls)
 
-                # pred_mask = pred_mask.repeat(1, 2, 1, 1) # 扩展通道，变为 [12, 3, 512, 1024]
-                # pred_cls = clsmodel(gray_image, pred_mask)
+            elif args.train_pattern in ['seg_train', 'texture_train', 'st_train']:# resize 到 256x256 送入分割模型
+                #images_for_seg = F.interpolate(images, size=(256, 256), mode='bilinear', align_corners=False)
 
-                pred_cls, _, _ = clsmodel(extracted_image, seg_image)
-
-            elif args.train_pattern in ['seg_train', 'texture_train', 'st_train']:
-                pred_seg, _, _, _, _ = segmodel(images)
-                pred_mask = torch.argmax(pred_seg, dim=1).unsqueeze(1).float()
+                seg_output, _, _, _, _ = segmodel(images)
+                # resize 回 512x1024
+                #pred_seg = F.interpolate(seg_output, size=(512, 1024), mode='bilinear', align_corners=False)
+                pred_mask = torch.argmax(seg_output, dim=1).unsqueeze(1).float()
                 # pred_mask = F.interpolate(pred_mask, size=(256, 512), mode='bilinear', align_corners=True)
                 # texture = F.interpolate(texture, size=(256, 512), mode='bilinear', align_corners=True)
                 pred_mask = pred_mask.repeat(1, 3, 1, 1)  # 扩展通道，变为 [12, 3, 512, 1024]
-                pred_cls = clsmodel(pred_mask)
+                pred_cls = clsmodel(images,pred_mask)
+
+            # <<<< 推理时间计时结束 <<<<
+            end_total = time.perf_counter()
+            total_infer_time += (end_total - start_total)
+            total_samples += images.size(0)
 
             cls_losses = criterion(pred_cls, labels)
             loss = cls_losses.mean()
@@ -252,7 +304,7 @@ def test_cls(segmodel, clsmodel, test_loader, criterion, config):
     report_5 = classification_report(all_labels, all_predictions, target_names=["Class 0", "Class 1", "Class 2", "Class 3", "Class 4"], digits=4)
     print("5-class Confusion Matrix:")
     print(cm_5.numpy())
-    print("5-class Accuracy:", acc_5)
+    print(f"5-class Accuracy: {acc_5 * 100:.2f}%")
     # print("5-class Classification Report:")
     # print(report_5)
 
@@ -261,35 +313,27 @@ def test_cls(segmodel, clsmodel, test_loader, criterion, config):
     tn, fp, fn, tp = cm_2.numpy().ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0  # 灵敏度
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0  # 特异性
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0  # 阳性预测值
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0  # 阴性预测值
     auc = roc_auc_score(all_labels_binary, all_probs_binary) if len(set(all_labels_binary)) > 1 else 0
 
     print("2-class Confusion Matrix:")
     print(cm_2.numpy())
-    print(f"2-class Accuracy: {acc_2:.4f}")
-    print(f"Sensitivity: {sensitivity:.4f}")
-    print(f"Specificity: {specificity:.4f}")
-    print(f"AUC: {auc:.4f}")
+    print(f"2-class Accuracy: {acc_2 * 100:.2f}%")
+    print(f"Sensitivity: {sensitivity * 100:.2f}%")
+    print(f"Specificity: {specificity * 100:.2f}%")
+    print(f"PPV (Precision): {ppv * 100:.2f}%")
+    print(f"NPV: {npv * 100:.2f}%")
+    print(f"AUC: {auc:.4f}")  # AUC 仍以小数形式保留
+    avg_infer_time = total_infer_time / total_samples
+    avg_seg_time = total_seg_infer_time / total_samples
+    avg_cls_time = total_cls_infer_time / total_samples
+    print(f"Average inference time per image: {avg_infer_time * 1000:.2f} ms")
+    print(f"Average segmentation model inference time per image: {avg_seg_time * 1000:.2f} ms")
+    print(f"Average classification model inference time per image: {avg_cls_time * 1000:.2f} ms")
 
-    # 保存结果到 JSON
-    results = {
-        "5-class": {
-            "accuracy": acc_5,
-            "confusion_matrix": cm_5.numpy().tolist(),
-            "classification_report": report_5
-        },
-        "2-class": {
-            "accuracy": acc_2,
-            "confusion_matrix": cm_2.numpy().tolist(),
-            "sensitivity": sensitivity,
-            "specificity": specificity,
-            "auc": auc
-        }
-    }
-    results_file = os.path.join(config.result_dir, 'test_results.json')
-    with open(results_file, 'w') as f:
-        json.dump(results, f, indent=4)
 
-    return ave_loss.avg, results
+    return ave_loss.avg
 
 
 def worker(args):
@@ -300,8 +344,8 @@ def worker(args):
     test_data = TransformerDataSet(args=args, pattern=args.test_pattern)
     test_loader = DataLoader(test_data, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
 
-    # 定义模型
-    segmodel = get_MedNeXt_model()
+
+
     if args.model_name == 'resnet18':
         clsmodel = getattr(resnet, args.model_name)(pretrained=args.pre_train, num_classes=args.num_class)
     elif args.model_name in ['convnext_pico', 'convnext_little', 'convnext_lite']:
@@ -331,8 +375,14 @@ def worker(args):
     elif args.model_name == 'ae_densenet121' :
         clsmodel = ModifiedDenseNet121(pretrained=True, num_classes=5)
 
-
-    segmodel = load_seg_weight(segmodel)
+        # 定义模型
+    if args.seg_model == 'MedNeXt':
+        segmodel = get_MedNeXt_model()
+        segmodel = load_seg_weight(segmodel)
+    else:
+        segmodel = KnowSAM()
+        segmodel = load_KnowSAM_weight(segmodel)
+    # summary( clsmodel , input_size=(1,args.frame_height, args.frame_width))
     clsmodel = load_cls_weight(clsmodel, args.weight_path)
 
     # 定义损失函数
@@ -362,7 +412,7 @@ def worker(args):
         drae_encoder = None
     criterion = criterion.to(device)
 
-    results = test_cls(segmodel, clsmodel, test_loader, criterion, args)
+    test_cls(segmodel, clsmodel, test_loader, criterion, args)
 
 
 

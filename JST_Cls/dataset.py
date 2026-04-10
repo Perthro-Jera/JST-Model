@@ -9,6 +9,7 @@ import pandas as pd
 from torch.utils.data import Dataset
 from torch.utils.data.sampler import Sampler
 from util import ImageProcessor
+import tifffile
 
 def verify_file_paths(image_paths, mask_paths):
         invalid_image_paths = [path for path in image_paths if not os.path.isfile(path)]
@@ -200,10 +201,12 @@ class TransUnetDataSet(Dataset):
     def __load_file(self, pattern="train", fold_num=0):
         if pattern in ["train", "test", "distill_label"]:
             file_path = os.path.join("dataset", "data_huafen.xlsx")
+            #file_path = os.path.join("dataset", "data337.xlsx")
             l_d = {0: '第一折', 1: '第二折', 2: '第三折', 3: '第四折', 4: '第五折'}
             df_frame = pd.read_excel(file_path, sheet_name=l_d[fold_num])
             # 将label转化为整形
-            label_map = {'宫颈炎': 0, '囊肿': 1, '外翻': 2}  # Example mapping
+            #label_map = {'宫颈炎': 0, '囊肿': 1, '外翻': 2, '高级别病变': 3, '宫颈癌': 4,}  # Example mapping
+            label_map = {'宫颈炎': 0, '囊肿': 1, '外翻': 2 }
             if pattern in ["train", "distill_label"]:
                 # 这个地方先注释掉，后面真正进行5折时再修改回来
                 # df_frame = df_frame.iloc[:int(len(df_frame) * 0.8), :]
@@ -211,7 +214,7 @@ class TransUnetDataSet(Dataset):
             else:
                 # 这个地方先注释掉，后面真正进行5折时再修改回来
                 # df_frame = df_frame.iloc[int(len(df_frame) * 0.8):, :]
-                df_frame = pd.read_excel(file_path, sheet_name=l_d[3])
+                df_frame = pd.read_excel(file_path, sheet_name=l_d[1])
                 pass
             # Filter out rows where label is not in label_map
             df_frame = df_frame[df_frame['label'].isin(label_map.keys())]
@@ -340,6 +343,7 @@ class TransformerDataSet(Dataset):
 
             # 根据路径读取图片和标签
             img = cv2.imread(imgPath)  # ndarray [H, W, 3]
+            print(img.shape);
             #img = crop_background(img, self.args.crop_frame_height)  # [H, W, 3]
             #texture = cv2.imread(textPath,cv2.IMREAD_GRAYSCALE)
             texture = cv2.imread(textPath)
@@ -388,7 +392,101 @@ class TransformerDataSet(Dataset):
         texture_paths = df_frame['texture_path'].tolist()
         labels = df_frame['label'].tolist()
         return image_paths, texture_paths, labels
-        
+
+
+class EyeOCTClsDataset(Dataset):
+    def __init__(self, args, pattern='train'):
+        self.args = args
+        self.pattern = pattern
+
+        self.imgs, self.labels = self.__load_file(
+            pattern=pattern,
+            fold_num=args.fold_num
+        )
+
+        if not verify_clsfile_paths(self.imgs):
+            raise ValueError("检测到无效的 image 路径")
+
+        print(f"[EyeOCT-CLS] pattern={pattern}, samples={len(self.imgs)}")
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, index):
+        imgPath = self.imgs[index]
+        label = self.labels[index]
+
+        # ========== 1. 读取图像 ==========
+        if imgPath.endswith(".tif") or imgPath.endswith(".tiff"):
+            img = tifffile.imread(imgPath)
+        else:
+            img = cv2.imread(imgPath, cv2.IMREAD_UNCHANGED)
+
+        # if img.ndim == 2:
+        #     H_ori, W_ori = img.shape
+        #     print(f"原始图像尺寸: 高={H_ori} 像素, 宽={W_ori} 像素 (单通道)")
+        # else:
+        #     H_ori, W_ori, C_ori = img.shape
+        #     print(f"原始图像尺寸: 高={H_ori} 像素, 宽={W_ori} 像素, 通道数={C_ori}")
+        # 单通道 → 3 通道
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 1:
+            img = np.repeat(img, 3, axis=2)
+
+        # ========== 2. Resize ==========
+        H, W = self.args.frame_height, self.args.frame_width
+        img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+
+        # ---- 归一化 ----
+        if img.dtype == np.uint16:
+            img = img.astype(np.float32) / 65535.0
+        else:
+            img = img.astype(np.float32) / 255.0
+
+        # ========== 3. OCT Normalize（关键） ==========
+        img = img.astype(np.float32)
+        img = (img - img.mean()) / (img.std() + 1e-6)
+
+        # ========== 4. HWC → CHW ==========
+        img = torch.from_numpy(img.transpose(2, 0, 1)).float()
+        label = torch.tensor(label, dtype=torch.long)
+
+        return img, img, label, imgPath, imgPath
+
+    def __load_file(self, pattern="train", fold_num=0):
+
+
+        # 你之前已经统一：sheet0=train, sheet1=test
+        if pattern == "test":
+            if self.args.test_file == 'OCT2017':
+                file_path = 'dataset/OCT2017_cls.xlsx'
+            elif self.args.test_file == 'internal':
+                file_path = 'dataset/oct5k_classication.xlsx'
+            else:
+                file_path = 'dataset/RetinalOCT_cls.xlsx'
+            df = pd.read_excel(file_path, sheet_name=1)
+        else:
+            file_path = 'dataset/oct5k_classication.xlsx'
+            df = pd.read_excel(file_path, sheet_name=0)
+
+        # 眼科 label 映射（示例）
+        label_map = {
+            'Normal': 0,
+            #'AMD': 1,
+            'NORMAL': 0,
+            'DME': 1
+        }
+
+        df = df[df['label'].isin(label_map.keys())]
+        df['label'] = df['label'].map(label_map)
+        df.reset_index(drop=True, inplace=True)
+
+        image_paths = df['image_path'].tolist()
+        labels = df['label'].tolist()
+
+        return image_paths, labels
+
 
 class FrameDataSet(Dataset):
 

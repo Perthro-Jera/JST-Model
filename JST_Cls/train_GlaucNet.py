@@ -16,10 +16,11 @@ import albumentations as A
 import time
 import math
 from albumentations.pytorch.transforms import ToTensorV2
+import tifffile
 
 
 # === 1. 配置参数 ===
-EPOCHS = 50
+EPOCHS = 60
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 MIN_LR = 5e-7
@@ -27,18 +28,20 @@ WARMUP_EPOCHS = 10
 WEIGHT_DECAY = 0.6
 WEIGHT_DECAY_END = 0.4
 LATENT_DIM = 256
-HEIGHT = 512
-WIDTH = 1024
+HEIGHT = 256
+WIDTH = 512
 OCT_DEFAULT_MEAN = (0.3124)
 OCT_DEFAULT_STD = (0.2206)
 DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")  # 使用 GPU 1
-MODEL_SAVE_PATH = 'checkpoint/drae/drae_checkpoint.pth'  # 保存模型的路径
+MODEL_SAVE_PATH = 'checkpoint/baseline/checkpoint_oct5k_2_60_glaucnet256.pth'  # 保存模型的路径
+
 
 # === 2. 数据增强 ===
 train_transforms = A.Compose([
-    A.RandomResizedCrop(size=(HEIGHT, WIDTH),
-                        scale=(0.5, 1.0), ratio=(1.75, 2.25),
-                        interpolation=cv2.INTER_CUBIC),
+    # A.RandomResizedCrop(size=(HEIGHT, WIDTH),
+    #                     scale=(0.5, 1.0), ratio=(1.75, 2.25),
+    #                     interpolation=cv2.INTER_CUBIC),
+    A.Resize(height=HEIGHT, width=WIDTH, interpolation=cv2.INTER_NEAREST),
     A.HorizontalFlip(),
     A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=1),
     A.GaussianBlur(p=0.2),
@@ -75,6 +78,7 @@ class OCTDataset(Dataset):
         except Exception as e:
             print(f"Error loading image {img_path}: {e}")
             return self.__getitem__((idx + 1) % len(self.image_paths))
+
 
 class BalancedBatchSampler:
     def __init__(self, dataset, batch_size):
@@ -137,6 +141,8 @@ train_loader = DataLoader(
     num_workers=4
 )
 
+
+
 # === 4. 定义损失函数 ===
 mse_loss = nn.MSELoss()
 
@@ -175,7 +181,7 @@ def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epoch
 #加载分割模型训练权重
 def load_seg_weight(model):
     directory_path = os.path.join('train', 'MedNeXt', 'random_initial', '2')
-    weight_path = os.path.join('checkpoint',directory_path, 'MedNeXt_checkpoint_huafen337.pth')
+    weight_path = os.path.join('checkpoint',directory_path, 'MedNeXt_checkpoint_256_300.pth')
     #weight_path = os.path.join(weight_path, 'segmodel_checkpoint.pth')
     # 加载模型权重
     print('==> loading seg model')
@@ -213,6 +219,7 @@ def train():
 
         for batch_idx, (batch_images, batch_labels) in enumerate(train_loader):
             batch_images, batch_labels = batch_images.to(DEVICE), batch_labels.to(DEVICE)
+            batch_start_time = time.time()  # 记录开始时间
             # **避免额外梯度计算**
             with torch.no_grad():
                 images = batch_images.repeat(1, 3, 1, 1)
@@ -220,7 +227,9 @@ def train():
                 pred_mask = torch.argmax(seg_output, dim=1)  # [batch_size, height, width]
                 pred_mask = pred_mask.unsqueeze(1).float()
                 pred_mask = pred_mask.repeat(1, 2, 1, 1) # 扩展通道，变为 [12, 3, 512, 1024]
-
+                print("image.shape:", images.shape)
+                print("seg_output.shape:", seg_output.shape)
+                print("pred_mask.shape:", pred_mask.shape)
 
 
             output = clsmodel(batch_images, pred_mask)
@@ -233,6 +242,9 @@ def train():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            batch_time = time.time() - batch_start_time
+            print(f"Batch Time: {batch_time:.2f} seconds.")
+
             total_cls_loss += cls_loss.item()
             total_loss += loss.item()
 

@@ -8,24 +8,15 @@ from dataset import TransformerDataSet
 from dataset import TransUnetDataSet
 from dataset import TransformerLBPDataSet
 import models.resnet as resnet
-import models.resnet1 as resnet1
+
 import models.convnext as convnext
-from models.Unet import UNetClassifier
-#import models.vision_mamba as vim
-#import models.vmamba as vmamba
-import models.swin_transformer as swin_transformer
-import models.cswin as cswin
+from models.semi_MedNeXt import KnowSAM
 from torch.utils.data import DataLoader
 from models.MedNextV1 import get_MedNeXt_model
-from models.drae import DRAE
 from models.seg_drae import FusionModel
-from models.fusion import FeatureFusion
-from models.visiontransformer import get_vit_cls_model, DualViTClassifier, get_cls_token_model
-from timm.models.vision_transformer import VisionTransformer
 from util import save_checkpoint, cosine_scheduler, seeding
 from engine_train import train_ST_cls_epoch, train_cls_epoch, train_rec_cls_epoch, train_seg_drae_epoch
 from torch.optim import AdamW
-
 from criterion import CrossEntropy, OhemCrossEntropy
 from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter  # 导入 TensorBoard
@@ -44,8 +35,8 @@ def parse_option():
 
     # parameters for data
     parser.add_argument('--crop_frame_height', type=int, default=600, help='the frame height we used.')
-    parser.add_argument('--frame_height', type=int, default=512, help='the frame height we used during training.')
-    parser.add_argument('--frame_width', type=int, default=1024, help='the frame width we used during training.')
+    parser.add_argument('--frame_height', type=int, default=256, help='the frame height we used during training.')
+    parser.add_argument('--frame_width', type=int, default=512, help='the frame width we used during training.')
     parser.add_argument('--ignore_label', type=int, default=-1, help='ignoring the label of pixels')
 
     # folder num，以便用于内部数据集的交叉验证
@@ -57,7 +48,7 @@ def parse_option():
     # model parameters initialization pattern
     # parser.add_argument('--pre_train', action='store_true', help="weight initialized by the weight pretrained from "
     #                                                              "imageNet")
-    parser.add_argument('--pre_train', default=False, type=bool, help="weight initialized by the weight pretrained from "
+    parser.add_argument('--pre_train', default=True, type=bool, help="weight initialized by the weight pretrained from "
                                                                  "imageNet")
     parser.add_argument('--finetune', default=False, type=bool,help="pretrained model for fine-tuning")
 
@@ -67,7 +58,7 @@ def parse_option():
     parser.add_argument('--batch_size', type=int, default=16, help="training batch size")
     parser.add_argument('--num_workers', type=int, default=4, help="data loader thread")
 
-    parser.add_argument('--gpu', type=int, default=1, help='the gpu number will be used')
+    parser.add_argument('--gpu', type=int, default=0, help='the gpu number will be used')
     parser.add_argument('--checkpoint', type=str, default='checkpoint',
                         help='the directory to save the model weights.')
     parser.add_argument('--seed', default=42, type=int)
@@ -92,6 +83,7 @@ def parse_option():
            weight decay. We use a cosine schedule for WD.""")
     # resume
     parser.add_argument('--resume', action='store_true', help="if need to resume from the latest checkpoint")
+    parser.add_argument('--seg_model', default='KnowSAM', choices=['MedNeXt', 'KnowSAM'], help='选择分割模型')
     args = parser.parse_args()
     return args
 
@@ -121,7 +113,18 @@ def load_seg_weight(model):
     print('loading checkpoint from {}'.format(weight_path))
     print(state)
     return model
-    
+
+def load_KnowSAM_weight(model):
+
+    weight_path = os.path.join('checkpoint/train/KnowSAM/results_OCT_resize256_nomixup30_full_ablation/fold_0/SGDL_best_model.pth')
+    #weight_path = os.path.join('checkpoint/train/KnowSAM/eye/oct_full/SGDL_best_model.pth')#眼科oct分割权重
+    # 加载模型权重
+    print('==> loading seg model')
+    state = model.load_state_dict(torch.load(weight_path), strict=True)
+    print('loading checkpoint from {}'.format(weight_path))
+    print(state)
+    return model
+
 def worker(args):
     # model configuration
     model_name = args.model_name
@@ -162,7 +165,14 @@ def worker(args):
                           shuffle=True,  
                           drop_last=True)
     #调用模型
-    segmodel = get_MedNeXt_model()
+    #segmodel = get_MedNeXt_model()
+    if args.seg_model == 'MedNeXt':
+        segmodel = get_MedNeXt_model()
+        segmodel = load_seg_weight(segmodel)
+    else:
+        segmodel = KnowSAM()
+        segmodel = load_KnowSAM_weight(segmodel)
+
     if args.model_name == 'resnet18':
         clsmodel = getattr(resnet, model_name)(pretrained=pre_train, num_classes=num_class)
     elif args.model_name in ['convnext_pico', 'convnext_little', 'convnext_lite']:
@@ -183,7 +193,7 @@ def worker(args):
 
     
     #加载分割模型训练权重：
-    segmodel = load_seg_weight(segmodel)
+    #segmodel = load_seg_weight(segmodel)
     #fusion_model = FeatureFusion(drae_dim=256, output_channels=64)
 
 
@@ -195,6 +205,7 @@ def worker(args):
     # criterion
     # loss
     #500张数据权重
+    #class_weight = torch.FloatTensor([0.069, 0.286, 0.258, 0.45, 0.45])
     class_weight = torch.FloatTensor([0.069, 0.286, 0.258, 0.25, 0.25]) #'宫颈炎': 0, '囊肿': 1, '外翻': 2, '高级别病变': 3, '宫颈癌': 4
     #class_weight = torch.FloatTensor([0.069, 0.286, 0.258, 0.221, 0.166])
     #400张
@@ -224,7 +235,7 @@ def worker(args):
     param_pattern = 'pretrain' if args.pre_train else 'random_initial'
     dir_postfix = os.path.join(args.train_pattern, model_name, param_pattern, str(args.fold_num))
     checkpoint_dir = os.path.join('checkpoint', dir_postfix)
-    checkpoint_dir = 'checkpoint/drae/stru_checkpoint1.pth'
+    checkpoint_dir = 'checkpoint/baseline'
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # 使用余弦学习率
@@ -274,7 +285,7 @@ def worker(args):
                 'epoch': epoch + 1,
                 'state_dict': clsmodel.state_dict(),
                 'optimizer': optimizer.state_dict(),
-            }, checkpoint_dir=checkpoint_dir, is_best=False)
+            }, checkpoint_dir=checkpoint_dir, filename=f'checkpoint_convnext256.pth',is_best=False)
 
     writer.close()
 
